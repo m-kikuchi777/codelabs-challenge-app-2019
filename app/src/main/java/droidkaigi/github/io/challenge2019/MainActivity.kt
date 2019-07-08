@@ -1,30 +1,24 @@
 package droidkaigi.github.io.challenge2019
 
-import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.os.AsyncTask
 import android.os.Bundle
 import android.support.v4.widget.SwipeRefreshLayout
 import android.support.v7.widget.DividerItemDecoration
 import android.support.v7.widget.RecyclerView
-import android.util.Log
 import android.view.MenuItem
-import android.view.View
 import android.widget.ProgressBar
 import com.squareup.moshi.Types
 import droidkaigi.github.io.challenge2019.data.api.HackerNewsApi
 import droidkaigi.github.io.challenge2019.data.api.response.Item
 import droidkaigi.github.io.challenge2019.data.db.ArticlePreferences
 import droidkaigi.github.io.challenge2019.data.db.ArticlePreferences.Companion.saveArticleIds
-import retrofit2.Call
-import retrofit2.Callback
-import retrofit2.Response
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
+import droidkaigi.github.io.challenge2019.flux.actioncreator.MainActionCreator
+import droidkaigi.github.io.challenge2019.flux.dispatcher.Dispatcher
+import droidkaigi.github.io.challenge2019.flux.store.MainStore
 
 class MainActivity : BaseActivity() {
 
@@ -37,13 +31,13 @@ class MainActivity : BaseActivity() {
     private lateinit var swipeRefreshLayout: SwipeRefreshLayout
 
     private lateinit var storyAdapter: StoryAdapter
-    private lateinit var hackerNewsApi: HackerNewsApi
 
-    private var getStoriesTask: AsyncTask<Long, Unit, List<Item?>>? = null
     private val itemJsonAdapter = moshi.adapter(Item::class.java)
     private val itemsJsonAdapter =
         moshi.adapter<List<Item?>>(Types.newParameterizedType(List::class.java, Item::class.java))
 
+    private lateinit var mainActionCreator: MainActionCreator
+    private lateinit var mainStore: MainStore
 
     override fun getContentView(): Int {
         return R.layout.activity_main
@@ -51,13 +45,62 @@ class MainActivity : BaseActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        recyclerView = findViewById(R.id.item_recycler)
-        progressView = findViewById(R.id.progress)
-        swipeRefreshLayout = findViewById(R.id.swipe_refresh)
+
+        setUpView()
 
         val retrofit = createRetrofit("https://hacker-news.firebaseio.com/v0/")
 
-        hackerNewsApi = retrofit.create(HackerNewsApi::class.java)
+        val dispatcher = Dispatcher()
+        mainActionCreator = MainActionCreator(
+            HackerNewsRepository(retrofit.create(HackerNewsApi::class.java)),
+            dispatcher
+        )
+
+        mainStore = MainStore(dispatcher)
+
+        mainStore.failed.subscribe {
+            showError(it)
+        }
+
+        mainStore.topStories.subscribe {
+            progressView.visibility = Util.setVisibility(false)
+            swipeRefreshLayout.isRefreshing = false
+            storyAdapter.stories = it.toMutableList()
+            storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
+            storyAdapter.notifyDataSetChanged()
+        }
+
+        mainStore.story.subscribe { newItem ->
+            val item = storyAdapter.stories.find { it?.id == newItem.id }
+            val index = storyAdapter.stories.indexOf(item)
+            if (index != -1 ) {
+                storyAdapter.stories[index] = newItem
+                storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
+                storyAdapter.notifyItemChanged(index)
+            }
+        }
+
+        val savedStories = savedInstanceState?.let { bundle ->
+            bundle.getString(STATE_STORIES)?.let { itemsJson ->
+                itemsJsonAdapter.fromJson(itemsJson)
+            }
+        }
+
+        if (savedStories != null) {
+            storyAdapter.stories = savedStories.toMutableList()
+            storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
+            storyAdapter.notifyDataSetChanged()
+            progressView.visibility = Util.setVisibility(false)
+            return
+        }
+
+        mainActionCreator.loadTopStories()
+    }
+
+    private fun setUpView() {
+        recyclerView = findViewById(R.id.item_recycler)
+        progressView = findViewById(R.id.progress)
+        swipeRefreshLayout = findViewById(R.id.swipe_refresh)
 
         val itemDecoration = DividerItemDecoration(recyclerView.context, DividerItemDecoration.VERTICAL)
         recyclerView.addItemDecoration(itemDecoration)
@@ -77,24 +120,7 @@ class MainActivity : BaseActivity() {
                         clipboard.primaryClip = ClipData.newPlainText("url", item.url)
                     }
                     R.id.refresh -> {
-                        hackerNewsApi.getItem(item.id).enqueue(object : Callback<Item> {
-                            override fun onResponse(call: Call<Item>, response: Response<Item>) {
-                                response.body()?.let { newItem ->
-                                    val index = storyAdapter.stories.indexOf(item)
-                                    if (index == -1 ) return
-
-                                    storyAdapter.stories[index] = newItem
-                                    runOnUiThread {
-                                        storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
-                                        storyAdapter.notifyItemChanged(index)
-                                    }
-                                }
-                            }
-
-                            override fun onFailure(call: Call<Item>, t: Throwable) {
-                                showError(t)
-                            }
-                        })
+                        mainActionCreator.getItem(item.id)
                     }
                 }
             },
@@ -102,80 +128,9 @@ class MainActivity : BaseActivity() {
         )
         recyclerView.adapter = storyAdapter
 
-        swipeRefreshLayout.setOnRefreshListener { loadTopStories() }
-
-        val savedStories = savedInstanceState?.let { bundle ->
-            bundle.getString(STATE_STORIES)?.let { itemsJson ->
-                itemsJsonAdapter.fromJson(itemsJson)
-            }
-        }
-
-        if (savedStories != null) {
-            storyAdapter.stories = savedStories.toMutableList()
-            storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
-            storyAdapter.notifyDataSetChanged()
-            return
-        }
+        swipeRefreshLayout.setOnRefreshListener { mainActionCreator.loadTopStories() }
 
         progressView.visibility = Util.setVisibility(true)
-        loadTopStories()
-    }
-
-    private fun loadTopStories() {
-        hackerNewsApi.getTopStories().enqueue(object : Callback<List<Long>> {
-
-            override fun onResponse(call: Call<List<Long>>, response: Response<List<Long>>) {
-                if (!response.isSuccessful) return
-
-                response.body()?.let { itemIds ->
-                    getStoriesTask = @SuppressLint("StaticFieldLeak") object : AsyncTask<Long, Unit, List<Item?>>() {
-
-                        override fun doInBackground(vararg itemIds: Long?): List<Item?> {
-                            val ids = itemIds.mapNotNull { it }
-                            val itemMap = ConcurrentHashMap<Long, Item?>()
-                            val latch = CountDownLatch(ids.size)
-
-                            ids.forEach { id ->
-                                hackerNewsApi.getItem(id).enqueue(object : Callback<Item> {
-                                    override fun onResponse(call: Call<Item>, response: Response<Item>) {
-                                        response.body()?.let { item -> itemMap[id] = item }
-                                        latch.countDown()
-                                    }
-
-                                    override fun onFailure(call: Call<Item>, t: Throwable) {
-                                        showError(t)
-                                        latch.countDown()
-                                    }
-                                })
-                            }
-
-                            try {
-                                latch.await()
-                            } catch (e: InterruptedException) {
-                                showError(e)
-                                return emptyList()
-                            }
-
-                            return ids.map { itemMap[it] }
-                        }
-
-                        override fun onPostExecute(items: List<Item?>) {
-                            progressView.visibility = View.GONE
-                            swipeRefreshLayout.isRefreshing = false
-                            storyAdapter.stories = items.toMutableList()
-                            storyAdapter.alreadyReadStories = ArticlePreferences.getArticleIds(this@MainActivity)
-                            storyAdapter.notifyDataSetChanged()
-                        }
-                    }
-
-                    getStoriesTask?.execute(*itemIds.take(20).toTypedArray())
-                }
-            }
-
-            override fun onFailure(call: Call<List<Long>>, t: Throwable) {
-                showError(t)
-            }
-        })
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
@@ -197,7 +152,7 @@ class MainActivity : BaseActivity() {
         return when (item?.itemId) {
             R.id.refresh -> {
                 progressView.visibility = Util.setVisibility(true)
-                loadTopStories()
+                mainActionCreator.loadTopStories()
                 return true
             }
             else -> super.onOptionsItemSelected(item)
@@ -214,8 +169,6 @@ class MainActivity : BaseActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        getStoriesTask?.run {
-            if (!isCancelled) cancel(true)
-        }
+        mainActionCreator.cancel()
     }
 }
